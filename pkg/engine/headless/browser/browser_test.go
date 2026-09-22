@@ -4,8 +4,30 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/projectdiscovery/katana/pkg/engine/headless/types"
 	"github.com/stretchr/testify/require"
 )
+
+func TestLikelyClickableRejectsFocusOnlyElements(t *testing.T) {
+	focusOnly := &types.HTMLElement{
+		TagName: "SPAN",
+		Cursor:  "default",
+		Attributes: map[string]string{
+			"tabindex":    "0",
+			"data-testid": "tooltip-trigger",
+		},
+	}
+	require.False(t, isLikelyClickable(focusOnly))
+
+	pointerControl := *focusOnly
+	pointerControl.Cursor = "pointer"
+	require.True(t, isLikelyClickable(&pointerControl))
+
+	roleControl := *focusOnly
+	roleControl.Attributes = map[string]string{"tabindex": "0", "role": "button"}
+	require.True(t, isLikelyClickable(&roleControl))
+	require.True(t, isLikelyClickable(&types.HTMLElement{TagName: "BUTTON"}))
+}
 
 func TestNewLauncherDefaults(t *testing.T) {
 	t.Run("empty strategy defaults to heuristic", func(t *testing.T) {
@@ -17,7 +39,7 @@ func TestNewLauncherDefaults(t *testing.T) {
 	})
 
 	t.Run("explicit strategy is preserved", func(t *testing.T) {
-		for _, strategy := range []string{"none", "load", "domcontentloaded", "networkidle", "heuristic"} {
+		for _, strategy := range []string{"none", "load", "domcontentloaded", "networkidle", "heuristic", "adaptive"} {
 			l, err := NewLauncher(LauncherOptions{
 				MaxBrowsers:      1,
 				PageLoadStrategy: strategy,

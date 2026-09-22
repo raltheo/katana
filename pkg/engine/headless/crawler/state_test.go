@@ -6,8 +6,81 @@ import (
 
 	"github.com/pkg/errors"
 	"github.com/projectdiscovery/katana/pkg/engine/headless/crawler/normalizer/simhash"
+	"github.com/projectdiscovery/katana/pkg/engine/headless/types"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
+
+func TestNavigationStateIdentitySeparatesSPARoutesAndVisibleMenus(t *testing.T) {
+	button := func(id, text string, visible bool) *types.Action {
+		return &types.Action{
+			Type: types.ActionTypeLeftClick,
+			Element: &types.HTMLElement{
+				TagName:     "BUTTON",
+				ID:          id,
+				Classes:     "generated-" + id,
+				TextContent: text,
+				Visible:     visible,
+				Attributes:  map[string]string{"data-testid": "menu-item"},
+				DeepLocator: []types.ElementLocatorStep{{Type: "element", Selector: "#" + id}},
+			},
+		}
+	}
+
+	base := &types.PageState{URL: "https://example.test/#/home", StrippedDOM: "same-shell"}
+	first := *base
+	applyNavigationStateIdentity(&first, []*types.Action{button("radix-old", "Dashboard", true)})
+	regenerated := *base
+	applyNavigationStateIdentity(&regenerated, []*types.Action{button("radix-new", "Dashboard", true)})
+	require.Equal(t, first.UniqueID, regenerated.UniqueID, "generated IDs and classes must not split one state")
+
+	menuOpen := *base
+	applyNavigationStateIdentity(&menuOpen, []*types.Action{
+		button("radix-new", "Dashboard", true),
+		button("radix-child", "Session replay", true),
+	})
+	require.NotEqual(t, first.UniqueID, menuOpen.UniqueID, "a newly visible control must identify a distinct state")
+
+	hiddenChild := *base
+	applyNavigationStateIdentity(&hiddenChild, []*types.Action{
+		button("radix-new", "Dashboard", true),
+		button("radix-child", "Session replay", false),
+	})
+	require.Equal(t, first.UniqueID, hiddenChild.UniqueID, "hidden controls must not create phantom states")
+
+	otherRoute := &types.PageState{URL: "https://example.test/#/integrations", StrippedDOM: "same-shell"}
+	applyNavigationStateIdentity(otherRoute, []*types.Action{button("radix-new", "Dashboard", true)})
+	require.NotEqual(t, first.UniqueID, otherRoute.UniqueID, "SPA routes sharing one shell must stay distinct")
+}
+
+func TestSameInteractiveState(t *testing.T) {
+	recorded := &types.PageState{ActionSignature: "menu-closed"}
+	require.True(t, sameInteractiveState(recorded, &types.PageState{}), "legacy states without a signature remain compatible")
+	require.True(t, sameInteractiveState(recorded, &types.PageState{ActionSignature: "menu-closed"}))
+	require.False(t, sameInteractiveState(recorded, &types.PageState{ActionSignature: "menu-open"}))
+	require.False(t, sameInteractiveState(nil, recorded))
+}
+
+func TestRestoredRouteCompatible(t *testing.T) {
+	recorded := "https://example.test/app?tenant=one#/dashboard?project=1"
+	require.True(t, restoredRouteCompatible(recorded, recorded))
+	require.True(t, restoredRouteCompatible(
+		recorded,
+		"https://example.test/app?tenant=one&session=live#/dashboard?project=1&view=latest",
+	))
+	require.False(t, restoredRouteCompatible(
+		recorded,
+		"https://example.test/app?tenant=two#/dashboard?project=1",
+	), "an original query value may not change")
+	require.False(t, restoredRouteCompatible(
+		recorded,
+		"https://example.test/app?tenant=one#/settings?project=1",
+	), "a different SPA route must not be accepted")
+	require.False(t, restoredRouteCompatible(
+		recorded,
+		"https://example.test/app?tenant=one#/dashboard?view=latest",
+	), "an original fragment query parameter may not disappear")
+}
 
 func TestPageFingerprint_Stability(t *testing.T) {
 

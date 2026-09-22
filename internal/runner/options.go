@@ -28,13 +28,49 @@ func validateOptions(options *types.Options) error {
 
 	// Validate page load strategy
 	if options.PageLoadStrategy != "" {
-		validStrategies := []string{"heuristic", "load", "domcontentloaded", "networkidle", "none"}
+		validStrategies := []string{"heuristic", "adaptive", "load", "domcontentloaded", "networkidle", "none"}
 		if !slices.Contains(validStrategies, options.PageLoadStrategy) {
-			return errkit.New("invalid page-load-strategy: must be one of (heuristic, load, domcontentloaded, networkidle, none)")
+			return errkit.New("invalid page-load-strategy: must be one of (heuristic, adaptive, load, domcontentloaded, networkidle, none)")
 		}
 	} else {
 		// Default to heuristic
 		options.PageLoadStrategy = "heuristic"
+	}
+	if options.ScrollStep <= 0 {
+		options.ScrollStep = 700
+	}
+	if options.ScrollDelay < 0 {
+		return errkit.New("scroll-delay must be zero or greater")
+	}
+	if options.MaxScrollSteps <= 0 {
+		options.MaxScrollSteps = 40
+	}
+	if options.MaxActionDepth < 0 {
+		return errkit.New("max-action-depth must be zero or greater")
+	}
+	if options.MaxStaleActionFamily < 0 {
+		return errkit.New("max-stale-action-family must be zero or greater")
+	}
+	if options.MaxActionsPerState < 0 {
+		return errkit.New("max-actions-per-state must be zero or greater")
+	}
+	if options.MaxActionsPerCrawl < 0 {
+		return errkit.New("max-actions-per-crawl must be zero or greater")
+	}
+	if options.MaxActionRuntime < 0 {
+		return errkit.New("max-action-runtime must be zero or greater")
+	}
+	if options.MaxActionRetries < 0 {
+		return errkit.New("max-action-retries must be zero or greater")
+	}
+	if options.ActionPreflightTimeout < 0 {
+		return errkit.New("action-preflight-timeout must be zero or greater")
+	}
+	if options.ActionSignalTimeout < 0 {
+		return errkit.New("action-signal-timeout must be zero or greater")
+	}
+	if options.ActionQuietPeriod < 0 {
+		return errkit.New("action-quiet-period must be zero or greater")
 	}
 
 	// Disabling automatic form fill (-aff) for headless navigation due to incorrect implementation.
@@ -48,7 +84,7 @@ func validateOptions(options *types.Options) error {
 	if options.Headless && options.HeadlessHybrid {
 		return errkit.New("flags -hl (headless) and -hh (hybrid) are mutually exclusive")
 	}
-	
+
 	// Warn if -headless or -hh is used with -cwu (Chrome WebSocket URL)
 	// The ChromeWSUrl takes precedence and pure headless engine will be used
 	if options.Headless && options.ChromeWSUrl != "" {

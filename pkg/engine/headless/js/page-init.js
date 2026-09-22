@@ -111,6 +111,14 @@
       const __origSetTimeout = window.setTimeout;
       const __origSetInterval = window.setInterval;
 
+      // Internal crawler waits must remain real-time even though application
+      // timers below are accelerated.
+      Object.defineProperty(window, "__katanaSleep", {
+        value: (ms) => new Promise((resolve) => __origSetTimeout(resolve, ms)),
+        writable: false,
+        configurable: false,
+      });
+
       const speedUpFactor = 0.1;
 
       function __wrappedSetTimeout(callback, delay, ...args) {
@@ -139,20 +147,10 @@
           return originalAddEventListener.call(this, type, listener, options);
         }
         let item = {
-          element: {
-            tagName: this.tagName,
-            id: this.id,
-            classes: this.className,
-            outerHTML: this.outerHTML.slice(0, 100), // Capture a snippet of the element's outerHTML
-            xpath: window.getXPath(this),
-            cssSelector: window.getCssPath(this),
-            attributes: window.getElementAttributes(this),
-            textContent: this.textContent.trim(),
-            hidden: this.hidden,
-            name: this.name,
-            type: this.type,
-            value: this.value,
-          },
+          // Keep the live node so its final locator can be computed after the
+          // framework has attached it to a shadow root or iframe document.
+          targetElement: this,
+          element: window._elementDataFromElement(this),
           type: type,
           listener: listener.toString(),
           options: options || {},
@@ -169,4 +167,3 @@
     try { if (__opts.hooked === true) hookNavigatedLinkSinks(); } catch (_) {}
     try { if (__opts.hooked === true) hookMiscellaneousUtilities(); } catch (_) {}
   })();
-  

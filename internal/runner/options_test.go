@@ -16,7 +16,7 @@ func newTestOptions() *types.Options {
 
 func TestValidatePageLoadStrategy(t *testing.T) {
 	t.Run("valid strategies are accepted", func(t *testing.T) {
-		for _, strategy := range []string{"heuristic", "load", "domcontentloaded", "networkidle", "none"} {
+		for _, strategy := range []string{"heuristic", "adaptive", "load", "domcontentloaded", "networkidle", "none"} {
 			opts := newTestOptions()
 			opts.PageLoadStrategy = strategy
 			err := validateOptions(opts)
@@ -67,4 +67,21 @@ func TestValidateHeadlessFlags(t *testing.T) {
 		err := validateOptions(opts)
 		require.NoError(t, err)
 	})
+}
+
+func TestValidateActionRuntimeLimits(t *testing.T) {
+	for _, mutate := range []func(*types.Options){
+		func(options *types.Options) { options.MaxStaleActionFamily = -1 },
+		func(options *types.Options) { options.MaxActionRuntime = -1 },
+		func(options *types.Options) { options.MaxActionRetries = -1 },
+		func(options *types.Options) { options.ActionPreflightTimeout = -1 },
+		func(options *types.Options) { options.ActionSignalTimeout = -1 },
+		func(options *types.Options) { options.ActionQuietPeriod = -1 },
+	} {
+		options := newTestOptions()
+		mutate(options)
+		err := validateOptions(options)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "must be zero or greater")
+	}
 }

@@ -58,6 +58,44 @@ type Options struct {
 	CrawlDuration time.Duration
 	// MaxFailureCount is the maximum number of consecutive failures before stopping
 	MaxFailureCount int
+	// ContinueOnActionFailure keeps processing queued headless actions after the
+	// consecutive failure threshold is reached.
+	ContinueOnActionFailure bool
+	// MaxStaleActionFamily limits repeated missing/non-interactable controls from
+	// one semantic family. Zero reuses MaxFailureCount.
+	MaxStaleActionFamily int
+	// MaxActionDepth optionally overrides MaxDepth for headless state actions.
+	// Zero preserves the historical MaxDepth behaviour.
+	MaxActionDepth int
+	// MaxActionsPerState limits actionable controls queued for one rendered
+	// state. Zero is unlimited.
+	MaxActionsPerState int
+	// MaxActionsPerCrawl limits attempted headless actions for one seed. Zero is
+	// unlimited.
+	MaxActionsPerCrawl int
+	// MaxActionRuntime limits one non-initial headless action, including origin
+	// restoration and post-action state capture. Zero disables the limit.
+	MaxActionRuntime int
+	// MaxActionRetries retries an action that reached MaxActionRuntime. Zero
+	// disables retries.
+	MaxActionRetries int
+	// ActionPreflightTimeout bounds target resolution, visibility and hit-test
+	// checks before a click. Zero preserves the legacy full page timeout.
+	ActionPreflightTimeout int
+	// ActionSignalTimeout bounds how long a click waits for its first observable
+	// URL, DOM or resource change. Zero preserves the legacy page-load wait.
+	ActionSignalTimeout int
+	// ActionQuietPeriod is the stable window, in milliseconds, required after an
+	// observed click effect before state capture continues.
+	ActionQuietPeriod int
+	// CaptureNewTabs discovers pages opened by an action and schedules their
+	// URLs while only closing targets owned by that action.
+	CaptureNewTabs bool
+	// ActionLogFile is an optional JSONL journal of headless action outcomes.
+	ActionLogFile string
+	// ActionDedupFile is an optional JSONL file containing previously confirmed
+	// semantic action coverage keys. Matching interactive actions are skipped.
+	ActionDedupFile string
 	// Delay is the delay between each crawl requests in seconds
 	Delay int
 	// RateLimit is the maximum number of requests to send per second
@@ -122,6 +160,15 @@ type Options struct {
 	HeadlessHybrid bool
 	// AutomaticFormFill enables optional automatic form filling and submission
 	AutomaticFormFill bool
+	// AutomaticScroll scrolls rendered pages before navigation discovery so
+	// lazy-loaded elements and requests can materialize.
+	AutomaticScroll bool
+	// ScrollStep is the vertical distance, in pixels, used by automatic scroll.
+	ScrollStep int
+	// ScrollDelay is the delay, in milliseconds, between automatic scroll steps.
+	ScrollDelay int
+	// MaxScrollSteps bounds automatic scrolling on very long or infinite pages.
+	MaxScrollSteps int
 	// FormExtraction enables extraction of form, input, textarea & select elements
 	FormExtraction bool
 	// UseInstalledChrome skips chrome install and use local instance
@@ -215,9 +262,9 @@ type Options struct {
 	DisableUniqueFilter bool
 	// MaxOnclickLinks is the maximum number of onclick links to process per page (default: 10)
 	MaxOnclickLinks int
-	// PageLoadStrategy specifies how to wait for pages to load (heuristic, load, domcontentloaded, networkidle, none)
+	// PageLoadStrategy specifies how to wait for pages to load (heuristic, adaptive, load, domcontentloaded, networkidle, none)
 	PageLoadStrategy string
-	// DOMWaitTime is the time in seconds to wait after domcontentloaded strategy (default: 5)
+	// DOMWaitTime is the fixed domcontentloaded delay or adaptive maximum wait (default: 5)
 	DOMWaitTime           int
 	CaptchaSolverProvider string
 	CaptchaSolverAPIKey   string

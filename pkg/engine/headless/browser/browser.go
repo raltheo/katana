@@ -53,6 +53,10 @@ type LauncherOptions struct {
 	SlowMotion          bool
 	Trace               bool
 	CookieConsentBypass bool
+	AutomaticScroll     bool
+	ScrollStep          int
+	ScrollDelay         int
+	MaxScrollSteps      int
 	PageLoadStrategy    string
 	ChromeWSUrl         string            // WebSocket URL to connect to existing Chrome
 	DOMWaitTime         int               // Time in seconds to wait for DOM (used with domcontentloaded strategy)
@@ -75,6 +79,15 @@ func NewLauncher(opts LauncherOptions) (*Launcher, error) {
 
 	if opts.DOMWaitTime <= 0 {
 		opts.DOMWaitTime = 5
+	}
+	if opts.ScrollStep <= 0 {
+		opts.ScrollStep = 700
+	}
+	if opts.ScrollDelay < 0 {
+		opts.ScrollDelay = 120
+	}
+	if opts.MaxScrollSteps <= 0 {
+		opts.MaxScrollSteps = 40
 	}
 
 	l := &Launcher{
@@ -208,7 +221,6 @@ func (l *Launcher) launchBrowserWithDataDir(userDataDir string) (*rod.Browser, e
 // Close closes the launcher
 func (l *Launcher) Close() {
 	l.browserPool.Cleanup(func(b *BrowserPage) {
-		b.cancel()
 		b.CloseBrowserPage()
 	})
 	close(l.browserPool)
@@ -246,6 +258,518 @@ var defaultWaitOptions = WaitOptions{
 	MaxTimeout:      15 * time.Second,
 }
 
+const adaptivePageMetricsExpression = `() => {
+	const now = performance.now();
+	if (!window.__katanaAdaptiveWait) {
+		const state = {lastMutation: now, mutationCount: 0, observed: new WeakSet()};
+		window.__katanaAdaptiveWait = state;
+	}
+	const state = window.__katanaAdaptiveWait;
+	if (!Number.isFinite(state.mutationCount)) state.mutationCount = 0;
+	const roots = [];
+	const documents = [];
+	const seen = new Set();
+	const visit = (root) => {
+		if (!root || seen.has(root) || !root.querySelectorAll) return;
+		seen.add(root);
+		roots.push(root);
+		if (root.nodeType === Node.DOCUMENT_NODE) documents.push(root);
+		for (const element of root.querySelectorAll('*')) {
+			if (element.shadowRoot) visit(element.shadowRoot);
+			if (element.tagName === 'IFRAME') {
+				try { if (element.contentDocument) visit(element.contentDocument); } catch (_) {}
+			}
+		}
+	};
+	visit(document);
+	for (const root of roots) {
+		const observedRoot = root.nodeType === Node.DOCUMENT_NODE ? root.documentElement : root;
+		if (!observedRoot || state.observed.has(observedRoot)) continue;
+		const observer = new MutationObserver((records) => {
+			state.lastMutation = performance.now();
+			state.mutationCount += records.length || 1;
+		});
+		try {
+			observer.observe(observedRoot, {
+				attributes: true,
+				childList: true,
+				characterData: true,
+				subtree: true
+			});
+			state.observed.add(observedRoot);
+		} catch (_) {}
+	}
+	const body = document.body;
+	const root = document.documentElement;
+	const selector = [
+		'a[href]', 'button', 'input:not([type="hidden"])', 'select', 'textarea',
+		'[role="button"]', '[role="link"]', '[onclick]', '[tabindex]:not([tabindex="-1"])'
+	].join(',');
+	let interactive = 0;
+	let domNodes = 0;
+	let bodyElements = 0;
+	let textLength = 0;
+	let htmlLength = 0;
+	let scrollHeight = 0;
+	for (const deepRoot of roots) {
+		let elements = [];
+		try { elements = Array.from(deepRoot.querySelectorAll('*')); } catch (_) {}
+		domNodes += elements.length;
+		const contentElements = deepRoot.nodeType === Node.DOCUMENT_NODE
+			? Array.from(deepRoot.body?.querySelectorAll('*') || [])
+			: elements;
+		bodyElements += contentElements.filter((element) => ![
+			'SCRIPT', 'STYLE', 'LINK', 'META', 'TEMPLATE', 'NOSCRIPT'
+		].includes(element.tagName)).length;
+		for (const element of elements) {
+			if (!element.matches?.(selector)) continue;
+			const view = element.ownerDocument?.defaultView || window;
+			const style = view.getComputedStyle(element);
+			const rect = element.getBoundingClientRect();
+			if (style.display !== 'none' && style.visibility !== 'hidden' &&
+				Number(style.opacity || 1) !== 0 && rect.width > 0 && rect.height > 0) interactive++;
+		}
+		if (deepRoot.nodeType === Node.DOCUMENT_NODE) {
+			const deepBody = deepRoot.body;
+			const deepDocument = deepRoot.documentElement;
+			textLength += String(deepBody?.innerText || '').trim().length;
+			htmlLength += String(deepDocument?.outerHTML || '').length;
+			scrollHeight = Math.max(scrollHeight, deepDocument?.scrollHeight || 0, deepBody?.scrollHeight || 0);
+		} else {
+			textLength += String(deepRoot.textContent || '').trim().length;
+			htmlLength += String(deepRoot.innerHTML || '').length;
+			scrollHeight = Math.max(scrollHeight, deepRoot.scrollHeight || 0);
+		}
+	}
+	let lastResource = 0;
+	let resources = 0;
+	for (const deepDocument of documents) {
+		try {
+			const deepPerformance = deepDocument.defaultView.performance;
+			for (const entry of deepPerformance.getEntriesByType('resource')) {
+				resources += 1;
+				if (deepDocument === document) lastResource = Math.max(lastResource, entry.responseEnd || entry.startTime || 0);
+			}
+		} catch (_) {}
+	}
+	return {
+		url: String(window.location.href || ''),
+		ready_state: String(document.readyState || ''),
+		dom_nodes: domNodes,
+		body_elements: bodyElements,
+		interactive_elements: interactive,
+		text_length: textLength,
+		html_length: htmlLength,
+		scroll_height: scrollHeight,
+		resource_count: resources,
+		mutation_count: Number(window.__katanaAdaptiveWait.mutationCount || 0),
+		mutation_age_ms: Math.max(0, now - window.__katanaAdaptiveWait.lastMutation),
+		resource_age_ms: lastResource > 0 ? Math.max(0, now - lastResource) : now,
+		scroll_steps: Number(window.__katanaAutoScrollSteps || 0)
+	};
+}`
+
+type adaptivePageMetrics struct {
+	URL                 string  `json:"url"`
+	ReadyState          string  `json:"ready_state"`
+	DOMNodes            int     `json:"dom_nodes"`
+	BodyElements        int     `json:"body_elements"`
+	InteractiveElements int     `json:"interactive_elements"`
+	TextLength          int     `json:"text_length"`
+	HTMLLength          int     `json:"html_length"`
+	ScrollHeight        int     `json:"scroll_height"`
+	ResourceCount       int     `json:"resource_count"`
+	MutationCount       int64   `json:"mutation_count"`
+	MutationAgeMS       float64 `json:"mutation_age_ms"`
+	ResourceAgeMS       float64 `json:"resource_age_ms"`
+	ScrollSteps         int     `json:"scroll_steps"`
+}
+
+func (m adaptivePageMetrics) meaningful() bool {
+	ready := m.ReadyState == "interactive" || m.ReadyState == "complete"
+	content := m.TextLength > 0 || m.InteractiveElements > 0 || m.BodyElements >= 2
+	return ready && m.BodyElements > 0 && m.HTMLLength >= 512 && content
+}
+
+func (m adaptivePageMetrics) signature() string {
+	return fmt.Sprintf(
+		"%d:%d:%d:%d:%d:%d",
+		m.DOMNodes,
+		m.BodyElements,
+		m.InteractiveElements,
+		m.TextLength,
+		m.HTMLLength,
+		m.ScrollHeight,
+	)
+}
+
+func (b *BrowserPage) adaptivePageMetrics() (adaptivePageMetrics, error) {
+	value, err := b.Eval(adaptivePageMetricsExpression)
+	if err != nil {
+		return adaptivePageMetrics{}, err
+	}
+	metrics := adaptivePageMetrics{}
+	if err := value.Value.Unmarshal(&metrics); err != nil {
+		return adaptivePageMetrics{}, err
+	}
+	return metrics, nil
+}
+
+// ActionActivitySnapshot is a cheap baseline captured immediately before a
+// physical click. MutationCount is maintained by the observer installed by
+// adaptivePageMetrics, so synchronous DOM changes cannot be missed between the
+// mouse event and the first post-click poll.
+type ActionActivitySnapshot struct {
+	URL           string
+	DOMSignature  string
+	ResourceCount int
+	MutationCount int64
+}
+
+// ActionActivityResult explains why the bounded post-click wait completed.
+// It is intentionally small so callers can journal timing decisions without
+// coupling themselves to the full adaptive DOM metrics structure.
+type ActionActivityResult struct {
+	SignalObserved bool
+	Reason         string
+	Elapsed        time.Duration
+}
+
+func (b *BrowserPage) CaptureActionActivity() (ActionActivitySnapshot, error) {
+	metrics, err := b.adaptivePageMetrics()
+	if err != nil {
+		return ActionActivitySnapshot{}, err
+	}
+	return ActionActivitySnapshot{
+		URL:           metrics.URL,
+		DOMSignature:  metrics.signature(),
+		ResourceCount: metrics.ResourceCount,
+		MutationCount: metrics.MutationCount,
+	}, nil
+}
+
+func sleepWithPageContext(ctx context.Context, duration time.Duration) error {
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+// WaitForActionActivity waits briefly for the first observable effect of a
+// click, then only as long as the page keeps making meaningful progress. A
+// true no-op returns after signalTimeout. A changing page receives the full
+// maxTimeout budget, while a stable DOM is accepted after a conservative
+// fallback window even when analytics traffic never becomes quiet.
+func (b *BrowserPage) WaitForActionActivity(
+	baseline ActionActivitySnapshot,
+	signalTimeout time.Duration,
+	quietPeriod time.Duration,
+	maxTimeout time.Duration,
+) (ActionActivityResult, error) {
+	started := time.Now()
+	result := ActionActivityResult{}
+	if signalTimeout <= 0 {
+		result.Reason = "disabled"
+		return result, nil
+	}
+	if quietPeriod <= 0 {
+		quietPeriod = 750 * time.Millisecond
+	}
+	if maxTimeout < signalTimeout+quietPeriod {
+		maxTimeout = signalTimeout + quietPeriod
+	}
+
+	const pollInterval = 100 * time.Millisecond
+	const stableDOMFallback = 4 * time.Second
+	ctx := b.Page.GetContext()
+	deadline := started.Add(maxTimeout)
+	signalDeadline := started.Add(signalTimeout)
+	lastURL := baseline.URL
+	lastSignature := baseline.DOMSignature
+	lastResourceCount := baseline.ResourceCount
+	lastMutationCount := baseline.MutationCount
+	lastProgress := started
+	lastVisualProgress := started
+
+	finish := func(reason string) (ActionActivityResult, error) {
+		result.Reason = reason
+		result.Elapsed = time.Since(started)
+		return result, nil
+	}
+
+	for {
+		if err := ctx.Err(); err != nil {
+			return result, err
+		}
+		now := time.Now()
+		if !now.Before(deadline) {
+			return finish("progress-timeout")
+		}
+
+		metrics, err := b.adaptivePageMetrics()
+		if err != nil {
+			// A document swap can make Runtime.evaluate briefly unavailable. Treat
+			// that as activity so a real navigation retains the full progress budget.
+			if !result.SignalObserved {
+				result.SignalObserved = true
+				lastProgress = now
+				lastVisualProgress = now
+			}
+			if err := sleepWithPageContext(ctx, pollInterval); err != nil {
+				return result, err
+			}
+			continue
+		}
+
+		urlChanged := metrics.URL != lastURL
+		domChanged := metrics.signature() != lastSignature
+		resourceChanged := metrics.ResourceCount != lastResourceCount
+		mutationChanged := metrics.MutationCount != lastMutationCount
+		if urlChanged || domChanged || resourceChanged || mutationChanged {
+			result.SignalObserved = true
+			lastProgress = now
+		}
+		if urlChanged || domChanged {
+			lastVisualProgress = now
+		}
+		lastURL = metrics.URL
+		lastSignature = metrics.signature()
+		lastResourceCount = metrics.ResourceCount
+		lastMutationCount = metrics.MutationCount
+
+		if !result.SignalObserved {
+			if !now.Before(signalDeadline) {
+				return finish("no-signal")
+			}
+		} else {
+			quiet := now.Sub(lastProgress) >= quietPeriod &&
+				metrics.MutationAgeMS >= float64(quietPeriod.Milliseconds()) &&
+				metrics.ResourceAgeMS >= float64(quietPeriod.Milliseconds())
+			if quiet {
+				return finish("quiet")
+			}
+			// Dynamic clocks and telemetry can keep counters moving without
+			// changing the rendered state. Retain the existing conservative
+			// four-second fallback instead of waiting for the full SPA timeout.
+			if now.Sub(lastVisualProgress) >= stableDOMFallback {
+				return finish("stable-dom")
+			}
+		}
+
+		if err := sleepWithPageContext(ctx, pollInterval); err != nil {
+			return result, err
+		}
+	}
+}
+
+func (b *BrowserPage) automaticScroll(timeout time.Duration) error {
+	if !b.launcher.opts.AutomaticScroll {
+		return nil
+	}
+	script := fmt.Sprintf(`async () => {
+		const step = %d;
+		const delay = %d;
+		const limit = %d;
+		const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+		const sleepReal = window.__katanaSleep || sleep;
+		// requestAnimationFrame may be suspended indefinitely in a background
+		// external-Chrome tab. Race it with a real timer so automatic scrolling
+		// remains bounded without skipping normal paint synchronization.
+		const painted = () => new Promise(resolve => {
+			let settled = false;
+			const finish = () => {
+				if (settled) return;
+				settled = true;
+				resolve();
+			};
+			requestAnimationFrame(finish);
+			sleepReal(100).then(finish);
+		});
+		const contexts = [];
+		const seenRoots = new Set();
+		const visit = (root) => {
+			if (!root || seenRoots.has(root) || !root.querySelectorAll) return;
+			seenRoots.add(root);
+			if (root.nodeType === Node.DOCUMENT_NODE && root.defaultView) {
+				contexts.push({kind: 'window', target: root.defaultView, start: root.defaultView.scrollY || 0});
+			}
+			for (const element of root.querySelectorAll('*')) {
+				if (element.shadowRoot) visit(element.shadowRoot);
+				if (element.tagName === 'IFRAME') {
+					try { if (element.contentDocument) visit(element.contentDocument); } catch (_) {}
+				}
+				try {
+					const view = element.ownerDocument?.defaultView || window;
+					const style = view.getComputedStyle(element);
+					if (/(auto|scroll|overlay)/.test(style.overflowY) ||
+						/(auto|scroll|overlay)/.test(element.style?.overflowY || '')) {
+						contexts.push({kind: 'element', target: element, start: element.scrollTop || 0});
+					}
+				} catch (_) {}
+			}
+		};
+		visit(document);
+		let steps = 0;
+		for (const context of contexts) {
+			if (context.kind === 'window') {
+				const doc = context.target.document;
+				const initialHeight = Math.max(doc?.documentElement?.scrollHeight || 0, doc?.body?.scrollHeight || 0);
+				if (doc?.body && initialHeight <= context.target.innerHeight + 2) {
+					const probeHeight = Math.max(step + context.target.innerHeight, context.target.innerHeight * 2) + 'px';
+					context.originalBodyMinHeight = doc.body.style.minHeight;
+					context.originalRootMinHeight = doc.documentElement.style.minHeight;
+					doc.body.style.minHeight = probeHeight;
+					doc.documentElement.style.minHeight = probeHeight;
+					void doc.body.getBoundingClientRect();
+					context.probed = true;
+				}
+			} else if (context.target.scrollHeight <= context.target.clientHeight + 2) {
+				const spacer = context.target.ownerDocument.createElement('div');
+				spacer.setAttribute('data-katana-scroll-probe', '');
+				spacer.style.cssText = 'height:' + Math.max(step + context.target.clientHeight, context.target.clientHeight * 2) + 'px;pointer-events:none;';
+				context.target.appendChild(spacer);
+				context.spacer = spacer;
+			}
+			context.previousHeight = -1;
+			context.done = false;
+		}
+		while (steps < limit) {
+			let progressed = false;
+			for (const context of contexts) {
+				if (context.done) continue;
+				const target = context.target;
+				const doc = context.kind === 'window' ? target.document : null;
+				const height = context.kind === 'window'
+					? Math.max(doc?.documentElement?.scrollHeight || 0, doc?.body?.scrollHeight || 0)
+					: target.scrollHeight;
+				const current = context.kind === 'window' ? (target.scrollY || 0) : target.scrollTop;
+				const viewport = context.kind === 'window' ? target.innerHeight : target.clientHeight;
+				if (current + viewport >= height - 2 && height === context.previousHeight) {
+					context.done = true;
+					continue;
+				}
+				context.previousHeight = height;
+				if (context.kind === 'window') {
+					target.scrollTo(0, Math.min(current + step, height));
+					target.dispatchEvent(new target.Event('scroll'));
+				} else {
+					target.scrollTop = Math.min(current + step, height);
+					const view = target.ownerDocument?.defaultView || window;
+					target.dispatchEvent(new view.Event('scroll', {bubbles: true}));
+				}
+				steps += 1;
+				progressed = true;
+				await painted();
+				await sleep(delay);
+				if (steps >= limit) break;
+			}
+			if (!progressed) break;
+		}
+		// Let async lazy-load handlers consume their responses before restoring
+		// the original scroll position. Timers are accelerated by Katana, while
+		// animation frames remain tied to real browser paints.
+		for (let frame = 0; frame < 12; frame++) await painted();
+		await sleepReal(500);
+		for (const context of contexts.reverse()) {
+			if (context.kind === 'window') context.target.scrollTo(0, context.start);
+			else context.target.scrollTop = context.start;
+			if (context.probed) {
+				context.target.document.body.style.minHeight = context.originalBodyMinHeight;
+				context.target.document.documentElement.style.minHeight = context.originalRootMinHeight;
+			}
+			if (context.spacer) context.spacer.remove();
+		}
+		await sleep(delay);
+		window.__katanaAutoScrollSteps = steps;
+		return steps;
+	}`, b.launcher.opts.ScrollStep, b.launcher.opts.ScrollDelay, b.launcher.opts.MaxScrollSteps)
+	page := b.Page
+	if timeout > 0 {
+		page = b.Timeout(timeout)
+	}
+	_, err := page.Eval(script)
+	return err
+}
+
+// waitAdaptive waits for a meaningful rendered DOM rather than treating the
+// first quiet network gap as completion. DOMWaitTime is an upper bound: fast
+// pages finish as soon as DOM mutations and resource loads have both remained
+// quiet for a short window. A stable rendered DOM is also accepted after a
+// bounded delay when background telemetry never becomes idle. Optional
+// scrolling happens before readiness so lazy-loaded content is discovered.
+func (b *BrowserPage) waitAdaptive(allowScroll bool) error {
+	maximum := time.Duration(b.launcher.opts.DOMWaitTime) * time.Second
+	if maximum <= 0 {
+		maximum = 5 * time.Second
+	}
+	started := time.Now()
+	deadline := started.Add(maximum)
+	loadPage := b.Timeout(maximum)
+	_ = loadPage.WaitLoad()
+
+	const pollInterval = 100 * time.Millisecond
+	const quietWindow = 2 * time.Second
+	var meaningfulSince time.Time
+	var stableSince time.Time
+	lastSignature := ""
+	scrolled := false
+
+	for time.Now().Before(deadline) {
+		metrics, err := b.adaptivePageMetrics()
+		if err != nil {
+			time.Sleep(pollInterval)
+			continue
+		}
+		now := time.Now()
+		signature := metrics.signature()
+		if signature != lastSignature {
+			lastSignature = signature
+			stableSince = now
+		}
+		if !metrics.meaningful() {
+			meaningfulSince = time.Time{}
+			time.Sleep(pollInterval)
+			continue
+		}
+		if meaningfulSince.IsZero() {
+			meaningfulSince = now
+		}
+
+		if allowScroll && b.launcher.opts.AutomaticScroll && !scrolled {
+			if err := b.automaticScroll(time.Until(deadline)); err == nil {
+				scrolled = true
+				meaningfulSince = time.Now()
+				stableSince = meaningfulSince
+				lastSignature = ""
+				continue
+			}
+			// A scroll failure must not prevent the bounded readiness check.
+			scrolled = true
+		}
+
+		quiet := now.Sub(stableSince) >= quietWindow &&
+			metrics.MutationAgeMS >= float64(quietWindow.Milliseconds()) &&
+			metrics.ResourceAgeMS >= float64(quietWindow.Milliseconds())
+		// Telemetry, long polling and WebSockets must not keep a rendered SPA
+		// blocked forever. A stable meaningful DOM is sufficient even while new
+		// resource entries continue to appear.
+		meaningfulFallback := now.Sub(meaningfulSince) >= 4*time.Second &&
+			now.Sub(stableSince) >= quietWindow
+		if quiet || meaningfulFallback {
+			return nil
+		}
+		time.Sleep(pollInterval)
+	}
+
+	// The strategy is deliberately bounded. The caller can still inspect the
+	// current page and decide, using stronger evidence, whether it was rendered.
+	return nil
+}
+
 // WaitPageLoadHeurisitics waits for the page to load using multiple heuristics.
 // Strategy order:
 //  1. Wait for initial load event (covers classic navigation & first paint).
@@ -255,6 +779,17 @@ var defaultWaitOptions = WaitOptions{
 //
 // This keeps fast pages fast while still succeeding on noisy, long-running SPAs.
 func (b *BrowserPage) WaitPageLoadHeurisitics() error {
+	return b.waitPageLoadHeuristics(true)
+}
+
+// WaitPageLoadHeurisiticsWithoutScroll waits for readiness without performing
+// the expensive whole-page lazy-load pass. The crawler uses it immediately
+// after an action, then scrolls once only when the rendered state is new.
+func (b *BrowserPage) WaitPageLoadHeurisiticsWithoutScroll() error {
+	return b.waitPageLoadHeuristics(false)
+}
+
+func (b *BrowserPage) waitPageLoadHeuristics(allowScroll bool) error {
 	// Respect the page load strategy from launcher options
 	strategy := b.launcher.opts.PageLoadStrategy
 
@@ -284,6 +819,9 @@ func (b *BrowserPage) WaitPageLoadHeurisitics() error {
 		_ = chained.WaitLoad()
 		_ = chained.WaitIdle(2 * time.Second)
 		return nil
+
+	case "adaptive":
+		return b.waitAdaptive(allowScroll)
 
 	case "heuristic":
 		fallthrough
@@ -329,6 +867,16 @@ func (b *BrowserPage) WaitPageLoadHeurisitics() error {
 
 		return nil
 	}
+}
+
+// AutomaticScroll materializes lazy content using Katana's configured bounded
+// scroll policy. It is intentionally explicit so the crawler can run it once
+// per genuinely new post-action state.
+func (b *BrowserPage) AutomaticScroll(timeout time.Duration) error {
+	if !b.launcher.opts.AutomaticScroll {
+		return nil
+	}
+	return b.automaticScroll(timeout)
 }
 
 // WaitPageLoadHeuristicsFallback provides the enhanced timeouts for complex navigation
@@ -655,14 +1203,12 @@ func (l *Launcher) PutBrowserToPool(browser *BrowserPage) {
 	// Discard pages that hit a deadline or were cancelled to avoid immediately
 	// returning a poisoned page that will fail every subsequent call.
 	if cerr := browser.Page.GetContext().Err(); cerr != nil {
-		browser.cancel()
-		browser.CloseBrowserPage()
+		l.DiscardBrowserPage(browser)
 		return
 	}
 	// If the browser is not connected, close it
 	if !isBrowserConnected(browser.Browser) {
-		browser.cancel()
-		browser.CloseBrowserPage()
+		l.DiscardBrowserPage(browser)
 		return
 	}
 
@@ -676,8 +1222,7 @@ func (l *Launcher) PutBrowserToPool(browser *BrowserPage) {
 
 	pages, err := browser.Browser.Pages()
 	if err != nil {
-		browser.cancel()
-		browser.CloseBrowserPage()
+		l.DiscardBrowserPage(browser)
 		return
 	}
 
@@ -688,6 +1233,16 @@ func (l *Launcher) PutBrowserToPool(browser *BrowserPage) {
 		}
 	}
 	l.browserPool.Put(browser)
+}
+
+// DiscardBrowserPage removes a poisoned page and returns an empty token to the
+// bounded pool so the next action can create a clean replacement. Without the
+// nil token, Pool.Get blocks forever once a timed-out page has been removed.
+func (l *Launcher) DiscardBrowserPage(browser *BrowserPage) {
+	if browser != nil {
+		browser.CloseBrowserPage()
+	}
+	l.browserPool.Put(nil)
 }
 
 func isBrowserConnected(browser *rod.Browser) bool {
@@ -702,13 +1257,22 @@ func isBrowserConnected(browser *rod.Browser) bool {
 }
 
 func (b *BrowserPage) CloseBrowserPage() {
-	_ = b.Close() // Close the page/tab
+	// Use the browser connection rather than the page context: the latter is
+	// commonly already cancelled when this cleanup is needed. Target cleanup
+	// is bounded so a renderer stuck in JavaScript cannot stall the crawler.
+	closeCtx, cancelClose := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancelClose()
+	client := b.Browser.Context(closeCtx)
+	if b.TargetID != "" {
+		_, _ = proto.TargetCloseTarget{TargetID: b.TargetID}.Call(client)
+	}
 
 	// Only close the browser if we launched it ourselves (not connecting via ChromeWSUrl)
 	// If ChromeWSUrl was used, we should leave the browser running
 	if b.launcher.opts.ChromeWSUrl == "" {
-		_ = b.Browser.Close()
+		_ = client.Close()
 	}
+	b.cancel()
 
 	// Only cleanup temp data dir if we created it (not user-provided)
 	if b.userDataDir != "" && !b.launcher.shouldPreserveUserDataDir(b.userDataDir) {

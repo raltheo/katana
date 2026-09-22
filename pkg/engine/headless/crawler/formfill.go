@@ -67,11 +67,11 @@ func (c *Crawler) processForm(page *browser.BrowserPage, form *types.HTMLForm) e
 	elementMap := make(map[string]*rod.Element)
 
 	for _, field := range form.Elements {
-		if field.XPath == "" {
+		if field.XPath == "" && len(field.DeepLocator) == 0 {
 			continue
 		}
 
-		element, err := page.ElementX(field.XPath)
+		element, err := page.GetElement(field)
 		if err != nil {
 			c.logger.Debug("Could not find form element",
 				slog.String("xpath", field.XPath),

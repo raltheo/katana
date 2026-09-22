@@ -24,8 +24,11 @@ type PageState struct {
 	Title       string `json:"title,omitempty"`
 	DOM         string `json:"dom,omitempty"`
 	StrippedDOM string `json:"stripped_dom,omitempty"`
-	Depth       int    `json:"depth,omitempty"`
-	IsRoot      bool   `json:"is_root,omitempty"`
+	// ActionSignature separates interactive SPA states whose normalized DOM is
+	// identical (for example an open versus collapsed Shadow DOM menu).
+	ActionSignature string `json:"action_signature,omitempty"`
+	Depth           int    `json:"depth,omitempty"`
+	IsRoot          bool   `json:"is_root,omitempty"`
 
 	// NavigationAction is actions taken to reach this state
 	NavigationAction *Action `json:"navigation_actions,omitempty"`
@@ -43,13 +46,20 @@ type Action struct {
 }
 
 func (a *Action) Hash() string {
+	// Loading an absolute URL has the same effect regardless of which DOM state
+	// exposed it. Keeping OriginID in this identity lets persistent navigation
+	// links enqueue the same destination once for every volatile SPA state.
+	prefix := string(a.Type) + "|"
+	if a.Type != ActionTypeLoadURL {
+		prefix += a.OriginID + "|"
+	}
 	if a.Element != nil {
-		return a.Element.Hash()
+		return prefix + a.Element.Hash()
 	}
 	if a.Form != nil {
-		return a.Form.Hash()
+		return prefix + a.Form.Hash()
 	}
-	return string(a.Type) + "|" + a.Input + "|" + a.OriginID
+	return prefix + a.Input
 }
 
 func (a *Action) String() string {
@@ -131,18 +141,34 @@ func ActionFromEventListener(listener *EventListener) *Action {
 
 // HTMLElement represents a DOM element
 type HTMLElement struct {
-	TagName     string            `json:"tagName,omitempty"`
-	ID          string            `json:"id,omitempty"`
-	Classes     string            `json:"classes,omitempty"`
-	Attributes  map[string]string `json:"attributes,omitempty"`
-	Hidden      bool              `json:"hidden,omitempty"`
-	OuterHTML   string            `json:"outerHTML,omitempty"`
-	Type        string            `json:"type,omitempty"`
-	Value       string            `json:"value,omitempty"`
-	CSSSelector string            `json:"cssSelector,omitempty"`
-	XPath       string            `json:"xpath,omitempty"`
-	TextContent string            `json:"textContent,omitempty"`
-	MD5Hash     string            `json:"md5Hash,omitempty"`
+	TagName    string            `json:"tagName,omitempty"`
+	ID         string            `json:"id,omitempty"`
+	Classes    string            `json:"classes,omitempty"`
+	Attributes map[string]string `json:"attributes,omitempty"`
+	Hidden     bool              `json:"hidden,omitempty"`
+	Visible    bool              `json:"visible,omitempty"`
+	Cursor     string            `json:"cursor,omitempty"`
+	// PointerEventsNone is separate from Disabled because SPA menus commonly
+	// make a valid link temporarily non-interactable while its parent is
+	// collapsed. Such controls must be deferred, not discarded permanently.
+	PointerEventsNone bool                 `json:"pointerEventsNone,omitempty"`
+	Disabled          bool                 `json:"disabled,omitempty"`
+	OuterHTML         string               `json:"outerHTML,omitempty"`
+	Type              string               `json:"type,omitempty"`
+	Value             string               `json:"value,omitempty"`
+	CSSSelector       string               `json:"cssSelector,omitempty"`
+	XPath             string               `json:"xpath,omitempty"`
+	DeepLocator       []ElementLocatorStep `json:"deepLocator,omitempty"`
+	DocumentURL       string               `json:"documentURL,omitempty"`
+	TextContent       string               `json:"textContent,omitempty"`
+	MD5Hash           string               `json:"md5Hash,omitempty"`
+}
+
+// ElementLocatorStep identifies an element across open shadow roots and
+// same-origin iframe boundaries. XPath alone cannot cross either boundary.
+type ElementLocatorStep struct {
+	Type     string `json:"type"`
+	Selector string `json:"selector"`
 }
 
 func (e *HTMLElement) String() string {
@@ -181,6 +207,12 @@ func (e *HTMLElement) Hash() string {
 	for _, k := range stableAttrs {
 		parts = append(parts, fmt.Sprintf("%s:%s", k, e.Attributes[k]))
 	}
+	for _, step := range e.DeepLocator {
+		parts = append(parts, fmt.Sprintf("locator:%s:%s", step.Type, step.Selector))
+	}
+	if text := strings.Join(strings.Fields(e.TextContent), " "); text != "" {
+		parts = append(parts, "text:"+text)
+	}
 
 	hashInput := strings.Join(parts, "|")
 	if IsDiagnosticEnabled {
@@ -192,17 +224,18 @@ func (e *HTMLElement) Hash() string {
 
 // HTMLForm represents a form element
 type HTMLForm struct {
-	TagName     string            `json:"tagName,omitempty"`
-	ID          string            `json:"id,omitempty"`
-	Classes     string            `json:"classes,omitempty"`
-	Attributes  map[string]string `json:"attributes,omitempty"`
-	Hidden      bool              `json:"hidden,omitempty"`
-	OuterHTML   string            `json:"outerHTML,omitempty"`
-	Action      string            `json:"action,omitempty"`
-	Method      string            `json:"method,omitempty"`
-	Elements    []*HTMLElement    `json:"elements,omitempty"`
-	CSSSelector string            `json:"cssSelector,omitempty"`
-	XPath       string            `json:"xpath,omitempty"`
+	TagName     string               `json:"tagName,omitempty"`
+	ID          string               `json:"id,omitempty"`
+	Classes     string               `json:"classes,omitempty"`
+	Attributes  map[string]string    `json:"attributes,omitempty"`
+	Hidden      bool                 `json:"hidden,omitempty"`
+	OuterHTML   string               `json:"outerHTML,omitempty"`
+	Action      string               `json:"action,omitempty"`
+	Method      string               `json:"method,omitempty"`
+	Elements    []*HTMLElement       `json:"elements,omitempty"`
+	CSSSelector string               `json:"cssSelector,omitempty"`
+	XPath       string               `json:"xpath,omitempty"`
+	DeepLocator []ElementLocatorStep `json:"deepLocator,omitempty"`
 }
 
 func (f *HTMLForm) Hash() string {
@@ -223,6 +256,11 @@ func (f *HTMLForm) Hash() string {
 	for _, k := range stableAttrs {
 		parts = append(parts, fmt.Sprintf("%s:%s", k, f.Attributes[k]))
 	}
+	for _, step := range f.DeepLocator {
+		if step.Type != "element" {
+			parts = append(parts, fmt.Sprintf("locator:%s:%s", step.Type, step.Selector))
+		}
+	}
 	parts = append(parts, fmt.Sprintf("action:%s", f.Action), fmt.Sprintf("method:%s", f.Method))
 
 	// Include hashes of form elements
@@ -241,15 +279,22 @@ func (f *HTMLForm) Hash() string {
 // getStableAttributes returns a sorted slice of attribute keys that are considered stable.
 func getStableAttributes(attrs map[string]string) []string {
 	stableKeys := map[string]struct{}{
-		"id":          {},
-		"name":        {},
-		"type":        {},
-		"href":        {},
-		"src":         {},
-		"action":      {},
-		"method":      {},
-		"placeholder": {},
-		"onclick":     {},
+		"id":              {},
+		"name":            {},
+		"type":            {},
+		"href":            {},
+		"src":             {},
+		"action":          {},
+		"method":          {},
+		"placeholder":     {},
+		"onclick":         {},
+		"role":            {},
+		"title":           {},
+		"aria-label":      {},
+		"aria-labelledby": {},
+		"data-testid":     {},
+		"data-test":       {},
+		"data-cy":         {},
 	}
 
 	var stableAttrs []string

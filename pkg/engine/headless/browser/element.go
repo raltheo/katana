@@ -4,20 +4,25 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
+	"github.com/go-rod/rod"
 	"github.com/pkg/errors"
 	"github.com/projectdiscovery/katana/pkg/engine/headless/types"
 )
 
 const (
 	// buttonsCSSSelector is the css selector for all buttons
-	buttonsCSSSelector = "button, input[type='button'], input[type='submit']"
+	buttonsCSSSelector = "button, input[type='button'], input[type='submit'], [role='button'], [role='link'], [aria-haspopup], [onclick], summary, [tabindex]:not([tabindex='-1'])"
 	// linksCSSSelector is the css selector for all anchor tags
 	linksCSSSelector = "a"
 )
 
 // isElementDisabled checks if a button element is disabled
 func isElementDisabled(element *types.HTMLElement) bool {
+	if element.Disabled {
+		return true
+	}
 	if element.Attributes == nil {
 		return false
 	}
@@ -31,7 +36,7 @@ func isElementDisabled(element *types.HTMLElement) bool {
 	if classAttr, ok := element.Attributes["class"]; ok {
 		classList := strings.Fields(classAttr)
 		for _, class := range classList {
-			if class == "cursor-not-allowed" || class == "pointer-events-none" {
+			if class == "cursor-not-allowed" {
 				return true
 			}
 		}
@@ -43,6 +48,34 @@ func isElementDisabled(element *types.HTMLElement) bool {
 	}
 
 	return false
+}
+
+// isLikelyClickable rejects focus-only nodes. A tabindex makes an element
+// keyboard-focusable, but does not imply that clicking it can navigate or
+// reveal content (tooltip labels are a common example). Native controls,
+// explicit interactive semantics, inline handlers and pointer cursors remain
+// eligible. Registered event listeners are collected in a separate pass.
+func isLikelyClickable(element *types.HTMLElement) bool {
+	if element == nil {
+		return false
+	}
+	switch strings.ToUpper(strings.TrimSpace(element.TagName)) {
+	case "A", "BUTTON", "INPUT", "SUMMARY":
+		return true
+	}
+	attributes := element.Attributes
+	role := strings.ToLower(strings.TrimSpace(attributes["role"]))
+	switch role {
+	case "button", "link":
+		return true
+	}
+	if _, ok := attributes["aria-haspopup"]; ok {
+		return true
+	}
+	if strings.TrimSpace(attributes["onclick"]) != "" {
+		return true
+	}
+	return strings.EqualFold(strings.TrimSpace(element.Cursor), "pointer")
 }
 
 // FindNavigation attempts to find more navigations on the page which could
@@ -91,10 +124,9 @@ func (b *BrowserPage) FindNavigations() ([]*types.Action, error) {
 		return nil, errors.Wrap(err, "could not get buttons")
 	}
 	for _, button := range buttons {
-		if isElementDisabled(button) {
+		if !isLikelyClickable(button) {
 			continue
 		}
-
 		hash := button.Hash()
 		button.MD5Hash = hash
 
@@ -123,7 +155,11 @@ func (b *BrowserPage) FindNavigations() ([]*types.Action, error) {
 			continue
 		}
 
-		resolvedHref, err := resolveURL(info.URL, href)
+		baseURL := info.URL
+		if link.DocumentURL != "" {
+			baseURL = link.DocumentURL
+		}
+		resolvedHref, err := resolveURL(baseURL, href)
 		if err != nil {
 			continue
 		}
@@ -209,6 +245,15 @@ func (b *BrowserPage) GetAllElements(selector string) ([]*types.HTMLElement, err
 	return elements, nil
 }
 
+// GetAllElementsWithTimeout bounds deep Shadow DOM/iframe enumeration. A
+// detached or busy external Chrome target must not turn a stale action lookup
+// into a full page timeout for every queued control.
+func (b *BrowserPage) GetAllElementsWithTimeout(selector string, timeout time.Duration) ([]*types.HTMLElement, error) {
+	copy := *b
+	copy.Page = b.Timeout(timeout)
+	return copy.GetAllElements(selector)
+}
+
 func (b *BrowserPage) GetElementFromXpath(xpath string) (*types.HTMLElement, error) {
 	object, err := b.Eval(`() => window.getElementFromXPath(` + strconv.Quote(xpath) + `)`)
 	if err != nil {
@@ -220,6 +265,90 @@ func (b *BrowserPage) GetElementFromXpath(xpath string) (*types.HTMLElement, err
 		return nil, err
 	}
 	return element, nil
+}
+
+// GetElement resolves an element using a boundary-aware locator when one is
+// available, with XPath retained as a compatibility fallback for normal DOM.
+func (b *BrowserPage) GetElement(element *types.HTMLElement) (*rod.Element, error) {
+	if element != nil && len(element.DeepLocator) > 0 {
+		currentPage := b.Page
+		var currentRoot *rod.Element
+		for _, step := range element.DeepLocator {
+			var current *rod.Element
+			var err error
+			if currentRoot != nil {
+				current, err = currentRoot.Element(step.Selector)
+			} else {
+				current, err = currentPage.Element(step.Selector)
+			}
+			if err != nil {
+				return nil, err
+			}
+			switch step.Type {
+			case "shadow":
+				currentRoot, err = current.ShadowRoot()
+				if err != nil {
+					return nil, err
+				}
+			case "iframe":
+				currentPage, err = current.Frame()
+				if err != nil {
+					return nil, err
+				}
+				currentRoot = nil
+			case "element":
+				return current, nil
+			default:
+				return nil, errors.Errorf("unsupported locator step %q", step.Type)
+			}
+		}
+		return nil, errors.New("deep locator did not identify an element")
+	}
+	if element == nil || element.XPath == "" {
+		return nil, errors.New("element has no usable locator")
+	}
+	return b.ElementX(element.XPath)
+}
+
+// GetElementWithTimeout resolves an element with a bounded Rod query context.
+func (b *BrowserPage) GetElementWithTimeout(element *types.HTMLElement, timeout time.Duration) (*rod.Element, error) {
+	copy := *b
+	copy.Page = b.Timeout(timeout)
+	return copy.GetElement(element)
+}
+
+// GetElementData resolves and serializes the current element so callers can
+// verify that a stored action still targets the same node.
+func (b *BrowserPage) GetElementData(element *types.HTMLElement) (*types.HTMLElement, error) {
+	if element != nil && len(element.DeepLocator) > 0 {
+		resolved, err := b.GetElement(element)
+		if err != nil {
+			return nil, err
+		}
+		return b.GetResolvedElementData(resolved)
+	}
+	if element == nil || element.XPath == "" {
+		return nil, errors.New("element has no usable locator")
+	}
+	return b.GetElementFromXpath(element.XPath)
+}
+
+// GetResolvedElementData serializes an element that has already been resolved.
+// Keeping resolution and identity verification on the same DOM node prevents
+// a dynamic selector from being evaluated twice across a React re-render.
+func (b *BrowserPage) GetResolvedElementData(element *rod.Element) (*types.HTMLElement, error) {
+	if element == nil {
+		return nil, errors.New("resolved element is nil")
+	}
+	object, err := element.Eval(`() => window._elementDataFromElement(this)`)
+	if err != nil {
+		return nil, err
+	}
+	current := &types.HTMLElement{}
+	if err := object.Value.Unmarshal(current); err != nil {
+		return nil, err
+	}
+	return current, nil
 }
 
 func (b *BrowserPage) GetAllForms() ([]*types.HTMLForm, error) {
@@ -239,7 +368,7 @@ func (b *BrowserPage) GetAllForms() ([]*types.HTMLForm, error) {
 func (b *BrowserPage) GetEventListeners() ([]*types.EventListener, error) {
 	listeners := make([]*types.EventListener, 0)
 
-	eventlisteners, err := b.Eval(`() => window.__eventListeners`)
+	eventlisteners, err := b.Eval(`() => window.getAllRegisteredEventListeners()`)
 	if err == nil {
 		_ = eventlisteners.Value.Unmarshal(&listeners)
 	}

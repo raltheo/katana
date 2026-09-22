@@ -12,12 +12,44 @@
   
     // _elementDataFromElement returns the data for an element
     window._elementDataFromElement = function (el) {
+      let visible = false;
+      let pointerEventsNone = false;
+      let cursor = '';
+      try {
+        const style = el.ownerDocument.defaultView.getComputedStyle(el);
+        pointerEventsNone = style.pointerEvents === 'none';
+        cursor = String(style.cursor || '');
+        const rects = el.getClientRects();
+        visible = !el.hidden &&
+          style.display !== 'none' &&
+          style.visibility !== 'hidden' &&
+          style.visibility !== 'collapse' &&
+          Number(style.opacity || 1) > 0 &&
+          rects.length > 0 &&
+          Array.from(rects).some((rect) => rect.width > 0 && rect.height > 0);
+        if (visible && typeof el.checkVisibility === 'function') {
+          visible = el.checkVisibility({
+            checkOpacity: true,
+            checkVisibilityCSS: true,
+          });
+        }
+      } catch (_) {}
+      const disabled = Boolean(
+        el.disabled ||
+        el.hasAttribute('disabled') ||
+        ['true', '1'].includes(String(el.getAttribute('aria-disabled') || '').toLowerCase()) ||
+        el.classList.contains('cursor-not-allowed')
+      );
       return {
         tagName: el.tagName,
         id: el.id,
         classes: typeof el.className === 'string' ? el.className : Array.from(el.classList).join(' '),
         attributes: window.getElementAttributes(el),
         hidden: el.hidden,
+        visible: visible,
+        cursor: cursor,
+        pointerEventsNone: pointerEventsNone || el.classList.contains('pointer-events-none'),
+        disabled: disabled,
         outerHTML: el.outerHTML,
         name: el.name,
         type: el.type,
@@ -25,18 +57,103 @@
         textContent: el.textContent.trim(),
         xpath: window.getXPath(el),
         cssSelector: window.getCssPath(el),
+        deepLocator: window.getDeepLocator(el),
+        documentURL: String(el.ownerDocument?.location?.href || ''),
       };
+    };
+
+    // getDeepLocator builds a selector path that can cross open shadow roots
+    // and same-origin iframe documents. Each selector is relative to the root
+    // selected by the preceding step.
+    window.getDeepLocator = function (el) {
+      if (!el || el.nodeType !== Node.ELEMENT_NODE) return [];
+      const locator = [{ type: 'element', selector: window.getCssPath(el) }];
+      let root = el.getRootNode();
+      const seen = new Set();
+      while (root && root !== document && !seen.has(root)) {
+        seen.add(root);
+        if (root.nodeType === Node.DOCUMENT_FRAGMENT_NODE && root.host) {
+          locator.unshift({ type: 'shadow', selector: window.getCssPath(root.host) });
+          root = root.host.getRootNode();
+          continue;
+        }
+        if (root.nodeType === Node.DOCUMENT_NODE) {
+          let frame = null;
+          try { frame = root.defaultView?.frameElement || null; } catch (_) {}
+          if (!frame) break;
+          locator.unshift({ type: 'iframe', selector: window.getCssPath(frame) });
+          root = frame.getRootNode();
+          continue;
+        }
+        break;
+      }
+      return locator;
+    };
+
+    window.getElementFromDeepLocator = function (locator) {
+      try {
+        if (!Array.isArray(locator) || locator.length === 0) return null;
+        let root = document;
+        for (const step of locator) {
+          if (!step || !step.selector || !root?.querySelector) return null;
+          const element = root.querySelector(step.selector);
+          if (!element) return null;
+          if (step.type === 'shadow') {
+            root = element.shadowRoot;
+          } else if (step.type === 'iframe') {
+            root = element.contentDocument;
+          } else if (step.type === 'element') {
+            return element;
+          } else {
+            return null;
+          }
+          if (!root) return null;
+        }
+      } catch (_) {}
+      return null;
+    };
+
+    window.getElementDataFromDeepLocator = function (locator) {
+      const element = window.getElementFromDeepLocator(locator);
+      return element ? window._elementDataFromElement(element) : null;
+    };
+
+    // Visit the top document, every open shadow root and every accessible
+    // same-origin iframe. Cross-origin frames remain observable through CDP
+    // network capture but cannot safely expose their DOM to page JavaScript.
+    window.forEachDeepRoot = function (callback) {
+      const seen = new Set();
+      const visit = (root) => {
+        if (!root || seen.has(root) || !root.querySelectorAll) return;
+        seen.add(root);
+        callback(root);
+        let elements = [];
+        try { elements = Array.from(root.querySelectorAll('*')); } catch (_) {}
+        for (const element of elements) {
+          if (element.shadowRoot) visit(element.shadowRoot);
+          if (element.tagName === 'IFRAME') {
+            try { if (element.contentDocument) visit(element.contentDocument); } catch (_) {}
+          }
+        }
+      };
+      visit(document);
     };
   
     // getAllElements returns all the elements for a query
     // selector on the page
     window.getAllElements = function (selector) {
-      try {
-        const nodes = document.querySelectorAll(selector);
-        return Array.from(nodes).map((el) => _elementDataFromElement(el));
-      } catch (_) {
-        return [];
-      }
+      const results = [];
+      const seen = new Set();
+      window.forEachDeepRoot((root) => {
+        try {
+          for (const el of root.querySelectorAll(selector)) {
+            if (seen.has(el)) continue;
+            seen.add(el);
+            results.push(window._elementDataFromElement(el));
+          }
+        } catch (_) {}
+      });
+      return results;
     };
 
     window.getElementFromXPath = function (xpath) {
@@ -54,18 +171,47 @@
     // on the page along with their event listeners
     // TODO: Is it optimized? or do we need to do something else?
     window.getAllElementsWithEventListeners = function () {
-      const elements = document.querySelectorAll("*");
       const elementsWithListeners = [];
-      for (let el of elements) {
-        const listeners = getEventListeners(el);
-        if (listeners && listeners.length) {
-          elementsWithListeners.push({
-            element: _elementDataFromElement(el),
-            listeners: listeners,
+      window.forEachDeepRoot((root) => {
+        for (const el of root.querySelectorAll('*')) {
+          const listeners = getEventListeners(el);
+          if (listeners && listeners.length) {
+            elementsWithListeners.push({
+              element: window._elementDataFromElement(el),
+              listeners: listeners,
+            });
+          }
+        }
+      });
+      return elementsWithListeners;
+    };
+
+    window.getAllRegisteredEventListeners = function () {
+      const results = [];
+      const seenWindows = new Set();
+      window.forEachDeepRoot((root) => {
+        const frameWindow = root.nodeType === Node.DOCUMENT_NODE
+          ? root.defaultView
+          : root.ownerDocument?.defaultView;
+        if (!frameWindow || seenWindows.has(frameWindow)) return;
+        seenWindows.add(frameWindow);
+        let registered = [];
+        try { registered = frameWindow.__eventListeners || []; } catch (_) {}
+        for (const item of registered) {
+          const target = item.targetElement;
+          const element = target?.isConnected
+            ? window._elementDataFromElement(target)
+            : item.element;
+          if (!element) continue;
+          results.push({
+            element,
+            type: item.type,
+            listener: item.listener,
+            options: item.options || {},
           });
         }
-      }
-      return elementsWithListeners;
+      });
+      return results;
     };
   
     // getEventListeners returns all the event listeners
@@ -89,11 +235,11 @@
     // getAllForms returns all the forms on the page
     // along with their elements
     window.getAllForms = function () {
-      const forms = document.querySelectorAll("form");
-      const pseudoForms = document.querySelectorAll("div.form");
-      
-      const allForms = [...forms, ...pseudoForms];
-      return Array.from(allForms).map((form) => ({
+      const allForms = [];
+      window.forEachDeepRoot((root) => {
+        try { allForms.push(...root.querySelectorAll('form, div.form')); } catch (_) {}
+      });
+      return allForms.map((form) => ({
         tagName: form.tagName,
         id: form.id,
         classes: typeof form.className === 'string' ? form.className : Array.from(form.classList).join(' '),
@@ -103,6 +249,7 @@
         method: form.method,
         xpath: window.getXPath(form),
         cssSelector: window.getCssPath(form),
+        deepLocator: window.getDeepLocator(form),
         elements: form.elements ? 
           Array.from(form.elements).map((el) => _elementDataFromElement(el)) :
           Array.from(form.querySelectorAll('input, select, textarea, button')).map((el) => _elementDataFromElement(el))
@@ -159,7 +306,10 @@
   
       const id = node.getAttribute("id");
       if (optimized) {
-        if (id) return { value: `#${id}`, optimized: true };
+        if (id) return {
+          value: `#${window.escapeIdentifierIfNeeded(id)}`,
+          optimized: true,
+        };
         const nodeNameLower = node.nodeName.toLowerCase();
         if (
           nodeNameLower === "body" ||
@@ -170,7 +320,10 @@
       }
       const nodeName = node.nodeName;
   
-      if (id) return { value: `${nodeName}#${id}`, optimized: true };
+      if (id) return {
+        value: `${nodeName}#${window.escapeIdentifierIfNeeded(id)}`,
+        optimized: true,
+      };
       const parent = node.parentNode;
       if (!parent || parent.nodeType === Node.DOCUMENT_NODE)
         return { value: nodeName, optimized: true };
@@ -361,4 +514,3 @@
       return -1;
     };
   })();
-  
